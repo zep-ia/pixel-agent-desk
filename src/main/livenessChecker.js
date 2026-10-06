@@ -60,6 +60,67 @@ function detectClaudePidByTranscript(jsonlPath, callback) {
   }
 }
 
+/**
+ * Is this process a Claude Code CLI session?
+ *   comm: the executable (`ps -o comm=`): a path on macOS, a short name on Linux
+ *   args: the full command line (`ps -o args=`)
+ * The CLI shows up in two shapes:
+ *   - the native binary, whose executable is named `claude`. This covers a
+ *     terminal session and the copy the Claude desktop app launches from
+ *     ~/Library/Application Support/Claude/claude-code/.../MacOS/claude
+ *   - the older npm build, which runs under node and renames itself "claude"
+ * Going by the executable name, rather than looking for "claude" anywhere in
+ * the command line, keeps out the desktop app itself (`Claude`, `Claude
+ * Helper`), wrapper processes that take the claude path as an argument, and
+ * unrelated node tools. It also copes with spaces in the install path.
+ */
+function isClaudeCliProcess(comm, args) {
+  const exe = path.basename((comm || '').trim());
+  if (exe === 'claude' || exe === 'claude.exe') return true;
+  if (exe !== 'node') return false;
+  const cmd = (args || '').trim();
+  return /^claude(\s|$)/.test(cmd) || cmd.includes('@anthropic-ai/claude-code');
+}
+
+/**
+ * Run ps for one column and call back with a Map of pid → that column's
+ * text, or null if ps fails. One column per call because the value can
+ * contain spaces, and ps only prints a column in full when it is the last.
+ */
+function psColumn(column, callback) {
+  const { execFile } = require('child_process');
+  execFile('ps', ['-A', '-o', 'pid=', '-o', `${column}=`], { timeout: 3000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+    if (err || !stdout) return callback(null);
+    const rows = new Map();
+    for (const line of stdout.split('\n')) {
+      const match = line.match(/^\s*(\d+)\s+(.*)$/);
+      if (match) rows.set(parseInt(match[1], 10), match[2]);
+    }
+    callback(rows);
+  });
+}
+
+/**
+ * List the PIDs of running Claude Code CLI processes (macOS/Linux).
+ * Uses ps instead of pgrep because `pgrep -c` only exists in the Linux
+ * (procps) pgrep. On macOS it prints a usage error, so the count was always 0.
+ * Calls back with null when ps itself fails, so callers can tell
+ * "could not check" apart from "nothing running".
+ */
+function listClaudeCliPids(callback) {
+  psColumn('comm', (executables) => {
+    if (!executables) return callback(null);
+    psColumn('args', (commands) => {
+      if (!commands) return callback(null);
+      const pids = [];
+      for (const [pid, comm] of executables) {
+        if (isClaudeCliProcess(comm, commands.get(pid))) pids.push(pid);
+      }
+      callback(pids);
+    });
+  });
+}
+
 function detectClaudePidsFallback(callback) {
   const { execFile } = require('child_process');
   if (process.platform === 'win32') {
@@ -71,11 +132,7 @@ function detectClaudePidsFallback(callback) {
       callback(pids.length > 0 ? pids : null);
     });
   } else {
-    execFile('pgrep', ['-f', 'node.*claude'], { timeout: 3000 }, (err, stdout) => {
-      if (err || !stdout) return callback(null);
-      const pids = stdout.trim().split('\n').map(p => parseInt(p.trim(), 10)).filter(p => !isNaN(p) && p > 0);
-      callback(pids.length > 0 ? pids : null);
-    });
+    listClaudeCliPids((pids) => callback(pids && pids.length > 0 ? pids : null));
   }
 }
 
@@ -107,7 +164,8 @@ function retryPidDetection(sessionId, agentManager, debugLog) {
 }
 
 /**
- * Count running Claude CLI processes (node.exe *claude*)
+ * Count running Claude CLI processes.
+ * On macOS/Linux the callback gets null when the count could not be taken.
  */
 function countClaudeProcesses(callback) {
   const { execFile } = require('child_process');
@@ -118,9 +176,7 @@ function countClaudeProcesses(callback) {
       callback(parseInt(stdout.trim(), 10) || 0);
     });
   } else {
-    execFile('pgrep', ['-fc', 'node.*claude'], { timeout: 3000 }, (err, stdout) => {
-      callback(parseInt((stdout || '').trim(), 10) || 0);
-    });
+    listClaudeCliPids((pids) => callback(pids ? pids.length : null));
   }
 }
 
@@ -149,6 +205,12 @@ function zombieSweep(agentManager, debugLog) {
 
   countClaudeProcesses((processCount) => {
     _zombieSweepRunning = false;
+    // A failed count is not the same as zero processes. Sweeping on it would
+    // remove every live agent.
+    if (processCount === null) {
+      debugLog('[Live] Zombie sweep: could not count Claude processes, skipping');
+      return;
+    }
     if (processCount >= mainCount) return; // no excess avatars
 
     const excess = mainCount - processCount;
@@ -235,4 +297,4 @@ function startLivenessChecker({ agentManager, debugLog }) {
   return { zombieSweepId, livenessCheckId };
 }
 
-module.exports = { sessionPids, startLivenessChecker, detectClaudePidByTranscript };
+module.exports = { sessionPids, startLivenessChecker, detectClaudePidByTranscript, isClaudeCliProcess };
