@@ -71,9 +71,14 @@ function detectClaudePidsFallback(callback) {
       callback(pids.length > 0 ? pids : null);
     });
   } else {
-    execFile('pgrep', ['-f', 'node.*claude'], { timeout: 3000 }, (err, stdout) => {
+    // Exclude Claude desktop app (Claude.app) and its helpers, otherwise focus opens Claude instead of the terminal
+    execFile('ps', ['-axo', 'pid=,command='], { timeout: 3000 }, (err, stdout) => {
       if (err || !stdout) return callback(null);
-      const pids = stdout.trim().split('\n').map(p => parseInt(p.trim(), 10)).filter(p => !isNaN(p) && p > 0);
+      const pids = stdout.split('\n')
+        .map(l => l.trim().match(/^(\d+)\s+(.*)$/))
+        .filter(m => m && /(^|\/)claude(\s|$)|node.*claude/.test(m[2]) && !/\.app\//.test(m[2]) && !/pixel-agent-desk/.test(m[2]))
+        .map(m => parseInt(m[1], 10))
+        .filter(p => p > 0 && p !== process.pid);
       callback(pids.length > 0 ? pids : null);
     });
   }
