@@ -38,27 +38,71 @@ if ($hwnd -ne [IntPtr]::Zero) {
     });
 
   } else if (process.platform === 'darwin') {
-    // macOS: walk up parent chain to find a terminal window, then activate it
-    const script = `
-      tell application "System Events"
-        set targetPid to ${pid}
-        repeat 5 times
-          try
-            set proc to first process whose unix id is targetPid
-            set frontmost of proc to true
-            return
-          end try
-          try
-            set targetPid to unix id of (first process whose unix id is targetPid)'s parent process
-          on error
-            exit repeat
-          end try
-        end repeat
-      end tell
-    `;
-    execFile('osascript', ['-e', script], { timeout: 5000 }, (err) => {
-      if (err) debugLog(`[${label}] Focus error: ${err.message}`);
-    });
+    // macOS: System Events only sees applications, not Claude Code's node process.
+    // 1) If the session runs in iTerm2: select the exact tab by its tty.
+    // 2) Otherwise: walk up the parent chain with `ps` to find the terminal app.
+    const { execFileSync } = require('child_process');
+    const ps = (field, p) => {
+      try { return execFileSync('ps', ['-o', `${field}=`, '-p', String(p)]).toString().trim(); }
+      catch { return ''; }
+    };
+
+    const activateByParentChain = () => {
+      const chain = [];
+      let cur = Number(pid);
+      for (let i = 0; i < 10 && cur > 1; i++) {
+        chain.push(cur);
+        cur = Number(ps('ppid', cur)) || 0;
+      }
+      const list = chain.join(', ');
+      const script = `
+        tell application "System Events"
+          repeat with p in {${list}}
+            try
+              set frontmost of (first process whose unix id is (p as integer)) to true
+              return "ok"
+            end try
+          end repeat
+        end tell
+        return "notfound"`;
+      execFile('osascript', ['-e', script], { timeout: 5000 }, (err, out) => {
+        if (err) debugLog(`[${label}] Focus error: ${err.message}`);
+        else debugLog(`[${label}] Focus (parent chain): ${String(out).trim()}`);
+      });
+    };
+
+    const tty = ps('tty', pid);
+    if (tty && tty !== '??') {
+      const itermScript = `
+        if application "iTerm2" is running then
+          tell application "iTerm2"
+            repeat with w in windows
+              repeat with t in tabs of w
+                repeat with s in sessions of t
+                  if tty of s is "/dev/${tty}" then
+                    tell w to select
+                    tell t to select
+                    tell s to select
+                    activate
+                    return "ok"
+                  end if
+                end repeat
+              end repeat
+            end repeat
+          end tell
+        end if
+        return "notfound"`;
+      execFile('osascript', ['-e', itermScript], { timeout: 5000 }, (err, out) => {
+        if (!err && String(out).trim() === 'ok') {
+          debugLog(`[${label}] Focus iTerm2 session /dev/${tty}`);
+          return;
+        }
+        if (err) debugLog(`[${label}] iTerm2 focus error: ${err.message}`);
+        activateByParentChain();
+      });
+    } else {
+      activateByParentChain();
+    }
 
   } else {
     // Linux: use wmctrl if available, fall back to xdotool

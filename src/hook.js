@@ -14,6 +14,9 @@ process.stdin.on('end', () => {
         // process.ppid is not used because it returns the shell (cmd.exe) PID
         // Actual Claude PID is detected via PowerShell in main.js
         data._timestamp = Date.now();
+        // macOS/Linux: the hook's parent is the shell launched by Claude Code, in the same
+        // terminal (same tty). This is reliable for identifying the window/tab to focus.
+        if (process.platform !== 'win32') data._pid = process.ppid;
 
         const body = Buffer.from(JSON.stringify(data), 'utf-8');
 
